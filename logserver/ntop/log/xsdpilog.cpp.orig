@@ -1,0 +1,577 @@
+#include"ntop_includes.h"
+#include "lib/xs_prediction.h"
+
+#include<errno.h>
+
+#define GET_TIME(x)	time ((x))
+
+#define SOCKET_BUFFER_LEN 4*1024*1024
+
+void Xslog_init(void *param)
+{
+
+    PXSLOG_PARAM pXsLog=(PXSLOG_PARAM )param;
+
+    rb_root_init(&pXsLog->mapPartition);
+    rb_root_init(&pXsLog->mapPartitionUrl);
+
+    Xs_List_Init(&pXsLog->list);
+    int res=sem_init(&pXsLog->bin_sem,0,0);
+    if(res!=0)  perror("Semaphore initialization failed");
+}
+
+void   MysqlGetPartition_InsertMap_Log(PMYDBOP pDB,char * tablename,struct rb_root * pMapPartition)
+{
+    //    char sqlPartition[256]="select  partition_name part, partition_expression expr, \
+    //            partition_description descn, table_rows from information_schema.partitions\
+    //            where table_schema=schema() and table_name='tbnetlog';";
+    char sqlPartition[256]={0};
+    snprintf(sqlPartition,sizeof(sqlPartition)-1,"select  partition_name part, partition_expression expr, \
+             partition_description descn, table_rows from information_schema.partitions\
+             where table_schema=schema() and table_name='%s';",tablename);
+
+            MYSQLRECORDSET GetQueryPartition={0};
+    CSqlRecorDset_Init(&GetQueryPartition);
+    CSqlRecorDset_SetConn(&GetQueryPartition,pDB->m_pDB);
+    CSqlRecorDset_CloseRec(&GetQueryPartition);
+    CSqlRecorDset_ExecSQL(&GetQueryPartition, sqlPartition);
+    if(CSqlRecorDset_GetRecordCount(&GetQueryPartition)==0) {
+        CSqlRecorDset_CloseRec(&GetQueryPartition);
+        CSqlRecorDset_Destroy(&GetQueryPartition);
+        return ;
+    }
+
+    int i,nPartition=0;
+    struct rb_node * node_iter=NULL;
+    char szPartition[10] = {0};
+
+    for(i=0; i< CSqlRecorDset_GetRecordCount(&GetQueryPartition);i++)
+    {
+        CSqlRecorDset_GetFieldValue_String(&GetQueryPartition,"descn",szPartition,10);
+        nPartition = atoi(szPartition);
+        if(g_xsDebug)  printf("Partition:%d Table:%s\n",nPartition,tablename);
+        node_iter = int_void_rbsearch(pMapPartition,nPartition);
+        if(node_iter&&g_xsDebug)
+            printf("find to success Table:%s\n",tablename);
+        else{
+            node_iter = int_void_rbinsert(pMapPartition,nPartition,NULL);
+            if(node_iter&&g_xsDebug)
+                printf("Partition insert Faild %d Table:%s\n",nPartition,tablename);
+        }
+        CSqlRecorDset_MoveNext(&GetQueryPartition);
+    }
+    CSqlRecorDset_CloseRec(&GetQueryPartition);
+    CSqlRecorDset_Destroy(&GetQueryPartition);
+    return ;
+}
+
+
+int CreateUDPSocket(u_int16_t port,u_int16_t sendtimeout,u_int16_t recvtimeout,u_int8_t local)
+{
+    struct sockaddr_in sin={0};
+
+    sin.sin_family=AF_INET;
+    if(local) {
+        sin.sin_addr.s_addr = inet_addr("127.0.0.1");
+    } else {
+        sin.sin_addr.s_addr=htonl(INADDR_ANY);
+    }
+    sin.sin_port=htons(port);
+    socklen_t sin_len=sizeof(sin);
+
+    int nSocket=socket(AF_INET,SOCK_DGRAM,0);
+    if(-1==nSocket)
+        return -1;
+    if(-1 == bind(nSocket,(struct sockaddr *)&sin,sin_len)) {
+        close(nSocket);
+        return -1;
+    }
+
+    if(sendtimeout) {
+        struct timeval tv;
+        tv.tv_sec = sendtimeout;
+        tv.tv_usec=0;
+        setsockopt(nSocket,SOL_SOCKET,SO_SNDTIMEO,&tv,sizeof(tv));
+    }
+
+    if(recvtimeout) {
+        struct timeval tv;
+        tv.tv_sec = recvtimeout;
+        tv.tv_usec=0;
+        setsockopt(nSocket,SOL_SOCKET,SO_RCVTIMEO,&tv,sizeof(tv));
+    }
+
+    return nSocket;
+}
+
+
+void XsWriteLog_FailedAnalysis(char *pPopBuf,PXSLOG_PARAM pXsLog){
+    WriteLog("FailedAnalysis",pPopBuf);
+    pXsLog->nFailedAnalysis++;
+}
+
+void XsFree_pPopBuf(char *pPopBuf){
+    free(pPopBuf);
+    pPopBuf=NULL;
+}
+
+void   MyDBOp_Add_Partition(struct rb_root * pMapPartition,char * szSqlAdd,u_int bufDate,char * tablename){
+    struct rb_node *node;
+    node= int_void_rbsearch(pMapPartition,bufDate);
+    if(NULL==node){
+        sprintf(szSqlAdd,"alter table %s add  partition (partition p%d values in (%u));",tablename,bufDate,bufDate);
+        if(g_xsDebug)  printf("%s\n",szSqlAdd);
+        if(!MyDBOp_ExecSQL_1(&g_xsMySql ,szSqlAdd))
+            printf("%s:insert table failed\n",szSqlAdd);
+        node = int_void_rbinsert(pMapPartition,bufDate,NULL);
+        if(!node){
+            if(g_xsDebug)  printf("insert success:p%d Table:%s\n",bufDate,tablename);
+        }else{
+            if(g_xsDebug)  printf("Insert Faild:%d Table:%s\n",bufDate,tablename);
+        }
+    }
+}
+
+void XsDeal_MainTain_Partition(struct rb_root *pMapPartition,char * tablename){
+    int nPartitionCount=0;
+    char szSqlDrop[128]={0};
+    struct rb_node *node;
+    int n;
+
+    nPartitionCount=pMapPartition->ncount;//查看有多少分区
+    if(g_xsDebug)  printf("%d Table:%s\n",nPartitionCount,tablename);
+
+    if(pMapPartition->ncount>90){
+        node=rb_first(pMapPartition);
+        if(node){
+            n = node->key;
+            if(g_xsDebug)  printf("erase the first one :%d Table:%s\n",n,tablename);
+            rb_erase(node, pMapPartition);
+
+            sprintf(szSqlDrop,"alter table %s drop partition p%d;",tablename,n);
+            if(g_xsDebug)  printf("%s\n",szSqlDrop);
+            if(!MyDBOp_ExecSQL_1(&g_xsMySql ,szSqlDrop))
+                printf("%s:insert table failed\n",szSqlDrop);
+        }
+    }
+
+}
+
+
+void XsDBOp_Insert_UrlLog(PXSLOG_PARAM pXsLog,char * szSqlAdd,u_int bufDate,char *szSqlQuery){
+
+    MyDBOp_Add_Partition(&pXsLog->mapPartitionUrl,szSqlAdd,bufDate,"tburllog");
+
+    bool sql_return=MyDBOp_ExecSQL_1(&g_xsMySql,szSqlQuery);
+    if(!sql_return){
+        if(g_xsDebug)  printf("insert mysql failed\n");
+    }
+
+    XsDeal_MainTain_Partition(&pXsLog->mapPartitionUrl,"tburllog");
+}
+
+
+void XsDBOp_Insert_OthLog(PXSLOG_PARAM pXsLog,char * szSqlAdd,u_int bufDate,char *szSqlQuery){
+
+    MyDBOp_Add_Partition(&pXsLog->mapPartition,szSqlAdd,bufDate,"tbnetlog");
+
+    bool sql_return=MyDBOp_ExecSQL_1(&g_xsMySql,szSqlQuery);
+    if(!sql_return){
+        if(g_xsDebug)  printf("insert mysql failed\n");
+    }
+
+    XsDeal_MainTain_Partition(&pXsLog->mapPartition,"tbnetlog");
+}
+
+void *ThreadInsertTreeToMysql(void *param)
+{
+    PXSLOG_PARAM pXsLog=(PXSLOG_PARAM )param;
+    char bufLabel[10]={0};
+    char szbufDate[12]={0};
+    char bufTime[10]={0};
+    char bufSrc[30]={0};
+    char bufSip[20] = {0};
+    int nSport=0;
+    char bufDst[30]={0};
+    char bufDip[20] = {0};
+    int nDport=0;
+    char bufSmac[18]={0};
+    char bufType[15]={0};
+    char bufProto[10]={0};
+    char bufMethod[10]={0};
+    char bufUrl[1500]={0};
+    char szSqlAdd[256]={0};
+    char szSqlQuery[2048] = {0};
+    u_int bufDate;
+
+    char bufSnat[30]={0};
+    char bufSnat_ip[20] = {0};
+    int nSnat_port=0;
+<<<<<<< HEAD
+
+    char * pPopBuf;
+=======
+    char szUsr[32]={0};
+
+    char * pPopBuf=NULL;
+>>>>>>> master
+
+    while(!ntop->getGlobals()->isShutdown()){
+        sem_wait(&pXsLog->bin_sem);
+        pPopBuf=(char *) Xs_List_mc_POPList(&pXsLog->list);
+        if(!pPopBuf) continue;
+
+        memset(bufLabel,0,10);
+        GetParamValue(pPopBuf,"label:",bufLabel,10,";,",0);
+        if(strlen(bufLabel)==0){
+            if(g_xsDebug)
+                XsWriteLog_FailedAnalysis(pPopBuf,pXsLog);
+            XsFree_pPopBuf(pPopBuf);
+            continue;
+        }
+        if(g_xsDebug)  printf("%s\n",bufLabel);
+
+
+        memset(szbufDate,0,12);
+        GetParamValue(pPopBuf,"date:",szbufDate,12,";,",0);
+        if(strlen(szbufDate)==0){
+            if(g_xsDebug)
+                XsWriteLog_FailedAnalysis(pPopBuf,pXsLog);
+            XsFree_pPopBuf(pPopBuf);
+            continue;
+        }
+        bufDate = atoi(szbufDate);
+        if(g_xsDebug)  printf("%d\n",bufDate);
+
+
+        memset(bufTime,0,10);
+        GetParamValue(pPopBuf,"time:",bufTime,10,";,",0);
+        if(strlen(bufTime)==0){
+            if(g_xsDebug)
+                XsWriteLog_FailedAnalysis(pPopBuf,pXsLog);
+            XsFree_pPopBuf(pPopBuf);
+            continue;
+        }
+        if(g_xsDebug)  printf("%s\n",bufTime);
+
+
+        memset(bufSrc,0,30);
+        GetParamValue(pPopBuf,"src:",bufSrc,30,";,",0);
+        if(strlen(bufSrc)==0){
+            if(g_xsDebug)
+                XsWriteLog_FailedAnalysis(pPopBuf,pXsLog);
+            XsFree_pPopBuf(pPopBuf);
+            continue;
+        }
+        if(g_xsDebug)   printf("%s\n",bufSrc);
+        char *q=bufSrc;
+        memset(bufSip,0,20);
+        char *pPos = strstr(q,":");
+        if(pPos) {
+            strncpy( bufSip,q,pPos - q);
+            q = pPos + 1;
+        }else{
+            if(g_xsDebug)
+                printf("no found\n");
+            XsFree_pPopBuf(pPopBuf);
+            continue;
+        }
+        if(g_xsDebug) printf("%s\n",bufSip);
+        nSport = atoi(q);
+        if(g_xsDebug) printf("%s\n",q);
+
+        memset(bufDst,0,30);
+        GetParamValue(pPopBuf,"dst:",bufDst,30,";,",0);
+        if(strlen(bufDst)==0){
+            if(g_xsDebug)
+                XsWriteLog_FailedAnalysis(pPopBuf,pXsLog);
+            XsFree_pPopBuf(pPopBuf);
+            continue;
+        }
+        if(g_xsDebug)  printf("%s\n",bufDst);
+        char *J=bufDst;
+        memset(bufDip,0,20);
+        char *pPos1 = strstr(J,":");
+        if(pPos1){
+            strncpy( bufDip,J,pPos1 - J);
+            J = pPos1 + 1;
+        }else{
+            if(g_xsDebug)
+                printf("no found\n");
+            XsFree_pPopBuf(pPopBuf);
+            continue;
+        }
+        if(g_xsDebug)  printf("%s\n",bufDip);
+        nDport = atoi(J);
+        if(g_xsDebug)  printf("%s\n",J);
+
+        memset(bufSnat,0,30);
+        GetParamValue(pPopBuf,"snat:",bufSnat,30,";,",0);
+        if(strlen(bufSnat)==0){
+<<<<<<< HEAD
+            if(g_xsDebug)
+                XsWriteLog_FailedAnalysis(pPopBuf,pXsLog);
+            XsFree_pPopBuf(pPopBuf);
+            continue;
+        }
+        if(g_xsDebug)
+            printf("%s\n",bufSnat);
+        char *J2=bufSnat;
+        memset(bufSnat_ip,0,20);
+        char *pPos2 = strstr(J2,":");
+        if(pPos2){
+            strncpy( bufSnat_ip,J2,pPos2 - J2);
+            J2= pPos2 + 1;
+        }
+        else{
+            if(g_xsDebug)
+                printf("no found\n");
+            XsFree_pPopBuf(pPopBuf);
+            continue;
+
+        }
+        if(g_xsDebug)
+            printf("%s\n",bufSnat_ip);
+        nSnat_port = atoi(J2);
+        if(g_xsDebug)
+            printf("%s\n",J2);
+=======
+            memcpy(bufSnat_ip,"0",20);//为了适应没有snat字段的路由版本 赋值为0
+            nSnat_port=0;
+        }else{
+            if(g_xsDebug)
+                printf("%s\n",bufSnat);
+            char *J2=bufSnat;
+            memset(bufSnat_ip,0,20);
+            char *pPos2 = strstr(J2,":");
+            if(pPos2){
+                strncpy( bufSnat_ip,J2,pPos2 - J2);
+                J2= pPos2 + 1;
+            }
+            else{
+                if(g_xsDebug)
+                    printf("no found\n");
+                XsFree_pPopBuf(pPopBuf);
+                continue;
+            }
+            if(g_xsDebug)
+                printf("%s\n",bufSnat_ip);
+            nSnat_port = atoi(J2);
+            if(g_xsDebug)
+                printf("%s\n",J2);
+        }
+>>>>>>> master
+
+        memset(bufSmac,0,18);
+        GetParamValue(pPopBuf,"smac:",bufSmac,18,";,",0);
+        if(strlen(bufSmac)==0){
+            if(g_xsDebug)
+                XsWriteLog_FailedAnalysis(pPopBuf,pXsLog);
+            XsFree_pPopBuf(pPopBuf);
+            continue;
+        }
+        if(g_xsDebug)  printf("%s\n",bufSmac);
+
+        memset(bufType,0,15);
+        GetParamValue(pPopBuf,"type:",bufType,15,";,",0);
+        if(strlen(bufType)==0){
+            if(g_xsDebug)
+                XsWriteLog_FailedAnalysis(pPopBuf,pXsLog);
+            XsFree_pPopBuf(pPopBuf);
+            continue;
+        }
+        if(g_xsDebug)  printf("%s\n",bufType);
+
+        memset(bufProto,0,10);
+        GetParamValue(pPopBuf,"proto:",bufProto,10,";,",0);
+        if(strlen(bufProto)==0){
+            if(g_xsDebug)
+                XsWriteLog_FailedAnalysis(pPopBuf,pXsLog);
+            XsFree_pPopBuf(pPopBuf);
+            continue;
+        }
+        if(g_xsDebug)  printf("%s\n",bufProto);
+
+        memset(szUsr,0,32);
+        GetParamValue(pPopBuf,"usr:",szUsr,32,";,",0);
+        if(strlen(szUsr)==0){
+            memcpy(szUsr," ",32);//为了适应没有snat字段的路由版本 赋值为空格
+        }
+        if(g_xsDebug)
+            printf("%s\n",szUsr);
+
+
+        memset(bufMethod,0,10);
+        GetParamValue(pPopBuf,"method:",bufMethod,10,";,",0);
+        if(strlen(bufMethod)==0){
+            if(g_xsDebug)
+                XsWriteLog_FailedAnalysis(pPopBuf,pXsLog);
+            XsFree_pPopBuf(pPopBuf);
+            continue;
+        }
+        if(g_xsDebug)  printf("%s\n",bufMethod);
+
+        memset(bufUrl,0,1500);
+        GetParamValue(pPopBuf,"data:",bufUrl,1500,";,",0);
+        if(strlen(bufUrl)==0){
+            if(g_xsDebug)
+                XsWriteLog_FailedAnalysis(pPopBuf,pXsLog);
+            XsFree_pPopBuf(pPopBuf);
+            continue;
+        }
+        if(g_xsDebug)  printf("%s\n",bufUrl);
+
+        if((strcmp(bufType,"qqlog")==0)&&strlen(bufUrl)<=4){
+            XsFree_pPopBuf(pPopBuf);
+            continue;
+        }
+        //
+        if(g_xsDebug)  printf("FailedAnalysis: %d\n",pXsLog->nFailedAnalysis);
+
+        memset(szSqlQuery,0,2048);
+        memset(szSqlAdd,0,128);
+<<<<<<< HEAD
+        sprintf(szSqlQuery,"call prnetlog('%s',%ld,%d,%ld,%d,%ld,%d,'%s','%s','%s','%s','%s','%s','%s',%d,'%s')",bufLabel,atol(bufSip),nSport,
+                atol(bufDip),nDport,atol(bufSnat_ip),nSnat_port,bufSmac,bufMethod,bufUrl,"","",bufType,bufProto,bufDate,bufTime);
+        if(g_xsDebug)
+            printf("%s\n",szSqlQuery);
+=======
+>>>>>>> master
+
+        //
+        if((strcmp(bufType,"urllog")==0)){//URL日志
+            sprintf(szSqlQuery,"call prurllog('%s',%ld,%d,%ld,%d,%ld,%d,'%s','%s','%s',%d,'%s','%s','%s',%d,'%s','%s')",bufLabel,atol(bufSip),nSport,
+                    atol(bufDip),nDport,atol(bufSnat_ip),nSnat_port,bufSmac,bufMethod,bufUrl,1,"",bufType,bufProto,bufDate,bufTime,szUsr);
+            if(g_xsDebug)
+                printf("%s\n",szSqlQuery);
+
+            XsDBOp_Insert_UrlLog(pXsLog,szSqlAdd, bufDate,szSqlQuery);
+        } else{//其他日志
+            sprintf(szSqlQuery,"call prnetlog('%s',%ld,%d,%ld,%d,%ld,%d,'%s','%s','%s',%d,'%s','%s','%s',%d,'%s','%s')",bufLabel,atol(bufSip),nSport,
+                    atol(bufDip),nDport,atol(bufSnat_ip),nSnat_port,bufSmac,bufMethod,bufUrl,1,"",bufType,bufProto,bufDate,bufTime,szUsr);
+            if(g_xsDebug)
+                printf("%s\n",szSqlQuery);
+
+            XsDBOp_Insert_OthLog(pXsLog,szSqlAdd, bufDate,szSqlQuery);
+        }
+        //
+        XsFree_pPopBuf(pPopBuf);
+    }
+    return NULL;
+}
+
+
+void Xs_Set_UDPSocket_Buffer(int sock)
+{
+    long long sockbufflen = SOCKET_BUFFER_LEN;
+    long long sockopt = 0;
+    setsockopt(sock,SOL_SOCKET,SO_RCVBUF,(void *)&sockbufflen,sizeof(sockbufflen));
+    setsockopt(sock,SOL_SOCKET,SO_SNDBUF,(void *)&sockbufflen,sizeof(sockbufflen));
+    setsockopt(sock,SOL_SOCKET,SO_NO_CHECK,(void *)&sockopt,sizeof(sockopt));
+    return ;
+}
+
+
+void
+XsLog_work(PXSLOG_PARAM pXsLog)
+{
+    pXsLog->list.nums = 0;//
+
+    int len =0,err=0;
+    int reboot=0;  /*Create Udp Socket Failed 30times .We Reboot Program*/
+    char *buffer=NULL;
+    struct sockaddr_in sin;
+    socklen_t s_len = sizeof(sin);
+
+    int socket=CreateUDPSocket(pXsLog->port,0,0,0);
+    if(-1!=socket)
+        Xs_Set_UDPSocket_Buffer(socket);
+
+    while(!ntop->getGlobals()->isShutdown())
+    {
+        buffer=(char *)malloc(My_BUFSIZ);
+        if(!buffer)  continue;
+        memset(buffer,0,My_BUFSIZ);
+
+        len=recvfrom(socket, buffer,My_BUFSIZ,0,(struct sockaddr*)&sin,&s_len);
+        if(len <= 0)
+        {
+            if(buffer != NULL)
+                XsFree_pPopBuf(buffer);
+
+            printf("Recvfrom Failed:%d\n",errno);
+
+            err = errno;
+            if(err != EAGAIN && err != EINTR)
+            {
+                close(socket);
+                usleep(500);
+                socket = CreateUDPSocket(pXsLog->port,0,0,0);
+                if(reboot > 50)
+                {
+                    WriteLog("ntop","Main Thread: Re-Create UdpSocket Failed. Exit!!!!");
+                    kill(getpid(),SIGINT);
+                    sleep(1);
+                }
+                if(-1!=socket)
+                    Xs_Set_UDPSocket_Buffer(socket);
+                ++reboot;
+            }
+            continue;
+        }
+
+
+        static ulong totalCount = 0;
+        if(g_xsDebug){
+            ++totalCount;
+            printf("Get Packet:%lu\n",totalCount);
+            printf("%s\n\n", buffer);
+        }
+
+
+        if(unlikely(0 != Xs_List_mp_PushList(&pXsLog->list, buffer))) {
+            XsFree_pPopBuf(buffer);
+            continue;
+        }
+        sem_post(&pXsLog->bin_sem);
+        buffer = NULL;
+    }
+
+    close(socket);
+//    XsLog_destory(pXsLog);
+}
+
+
+void *ThreadXslogToMysql(void *param){
+    PXSLOG_PARAM pXsLog=(PXSLOG_PARAM )param;
+    int   err=0;
+
+    pthread_t t;
+    err=pthread_create(&t,NULL,ThreadInsertTreeToMysql,pXsLog);
+    if (err != 0) printf("Create ThreadInsertTreeToMysql Failed. %s\n", strerror(err));
+
+    XsLog_work(pXsLog);
+    close(t);
+
+    return NULL;
+}
+
+
+void XsLog_destory(PXSLOG_PARAM pXsLog)
+{
+    int_void_rbdestroy(&pXsLog->mapPartition);
+    int_void_rbdestroy(&pXsLog->mapPartitionUrl);
+    sem_destroy(&pXsLog->bin_sem);
+    Xs_List_Destroy(&pXsLog->list,free);
+}
+
+
+int GetLogMsg_InsertMysql_FromXsdpi(){
+//    MysqlGetPartition_InsertMap_Log(&g_xsMySql,"tbnetlog",&xslog.mapPartition);
+//    MysqlGetPartition_InsertMap_Log(&g_xsMySql,"tburllog",&xslog.mapPartitionUrl);
+    pthread_t t;
+    int err=pthread_create(&t,NULL,ThreadXslogToMysql,&xslog);
+    if (err != 0)
+        printf("Create ThreadXslogToMysql Failed. %s\n", strerror(err));
+    close(t);
+}

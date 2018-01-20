@@ -1,0 +1,130 @@
+#include <xsmysql/mydbop.h>
+#include <time.h>
+#include <unistd.h>
+#include <string.h>
+#include "pthread.h"
+
+/* ******************************** */
+bool xsmysql_connect(PMYDBOP pDB)
+{
+<<<<<<< HEAD
+        if(MyDBOp_OpenDB(pDB,"root","tXkj-8002-vErygood","ntop1","127.0.0.1",8306)){
+            printf("open data base ok (ntop1)\n");
+=======
+        if(MyDBOp_OpenDB(pDB,"root","tXkj-8002-vErygood","ntop","127.0.0.1",8306)){
+            printf("open data base ok (ntop)\n");
+>>>>>>> master
+        }else{
+            printf("connect data base failed ! exit!!!\n");
+            return false;
+        }
+    MyDBOp_ExecSQL_1(pDB,"set names utf8");
+    return true;
+}
+/* ******************************** */
+<<<<<<< HEAD
+
+=======
+>>>>>>> master
+void GetLocalTime(struct tm *st)
+{
+    time_t t = time(NULL);
+    struct tm *pst = localtime(&t);
+    memcpy(st,pst,sizeof(struct tm));
+    st->tm_year += 1900;
+    st->tm_mon+= 1;
+}
+
+
+void MyDBOp_Init(PMYDBOP pMyDB)
+{
+    memset(pMyDB,0,MYDBOP_SIZE);
+    struct tm st;
+    GetLocalTime(&st);
+    sprintf(pMyDB->szStarTime,"%04d-%02d-%02d %02d:%02d:%02d",st.tm_year,st.tm_mon,st.tm_mday,st.tm_hour,st.tm_min,st.tm_sec);
+    pMyDB->m_pDB = NULL;
+    CSqlRecorDset_Init(&pMyDB->m_Query);
+    pMyDB->m_nAlreadyInit=1;
+}
+
+void MyDBOp_Destroy(PMYDBOP pMyDB)
+{
+    MyDBOp_CloseDB(pMyDB);
+}
+
+bool MyDBOp_ReOpenDB(PMYDBOP pMyDB)
+{
+    MyDBOp_CloseDB(pMyDB);
+    bool bRet = MyDBOp_OpenDB(pMyDB,pMyDB->m_szUser,pMyDB->m_szPassword,pMyDB->m_szDBName,pMyDB->m_szIP,pMyDB->m_nPort);
+    return bRet;
+}
+
+bool MyDBOp_OpenDB(PMYDBOP pMyDB,char *pUser,char *pPassword,char *pDBName,char *pSvrIP,int nPort)
+{
+    pMyDB->m_pDB = (PMYSQLBASE)malloc(sizeof(MYSQLBASE));//new CSqlDataBase;
+    memset(pMyDB->m_pDB,0,sizeof(MYSQLBASE));
+    bool bRet = MysqlBase_OpenDB(pMyDB->m_pDB,pUser,pPassword,pDBName,pSvrIP,nPort);//m_pDB->OpenDB(pUser,pPassword,pDBName,pSvrIP,nPort);
+    if(bRet)
+    {
+        CSqlRecorDset_SetConn(&pMyDB->m_Query,pMyDB->m_pDB);//m_Query.InitConn(m_pDB);
+        CSqlRecorDset_ExecSQL(&pMyDB->m_Query,"set names gbk");//m_Query.ExecSQL("set names gbk");
+    }
+    strcpy(pMyDB->m_szUser,pUser);
+    strcpy(pMyDB->m_szPassword,pPassword);
+    strcpy(pMyDB->m_szDBName,pDBName);
+    strcpy(pMyDB->m_szIP,pSvrIP);
+    pMyDB->m_nPort = nPort;
+    return bRet;
+}
+
+bool MyDBOp_CloseDB(PMYDBOP pMyDB)
+{
+    if(pMyDB->m_pDB) {
+        MysqlBase_CloseDB(pMyDB->m_pDB);//m_pDB->CloseDB();
+        free(pMyDB->m_pDB);
+        pMyDB->m_pDB = NULL;
+    }
+    return true;
+}
+
+
+bool MyDBOp_ExecSQL(PMYDBOP pMyDB,char *pSQL)
+{
+    MYSQLRECORDSET Query={0};
+    CSqlRecorDset_Init(&Query);
+    CSqlRecorDset_SetConn(&Query,pMyDB->m_pDB);//Query.InitConn(m_pDB);
+
+    if(!CSqlRecorDset_ExecSQL(&Query,pSQL))
+    {
+        CSqlRecorDset_Destroy(&Query);
+        return false;
+    }
+    CSqlRecorDset_Destroy(&Query);
+    return true;
+}
+
+bool MyDBOp_ExecSQL_1(PMYDBOP pMyDB,char *pSQL)
+{
+    if(!CSqlRecorDset_ExecSQL(&pMyDB->m_Query,pSQL))
+    {
+        return false;
+    }
+    return true;
+}
+
+void MyDBOp_Ping(PMYDBOP pMyDB)
+{
+    PMYSQLBASE m_pDB=pMyDB->m_pDB;
+    if(!m_pDB || !m_pDB->m_con){
+        MyDBOp_ReOpenDB(pMyDB);
+        return;
+    }
+    pthread_mutex_lock(&m_pDB->m_cs);//EnterCriticalSection(&m_pDB->m_cs);
+    int ret = mysql_ping(m_pDB->m_con);
+    m_pDB->conn_status = ret;
+    pthread_mutex_unlock(&m_pDB->m_cs);//EnterCriticalSection(&m_pDB->m_cs);
+    if(0 != m_pDB->conn_status){
+        MyDBOp_ReOpenDB(pMyDB);
+        return;
+    }
+}

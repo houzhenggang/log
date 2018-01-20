@@ -1,0 +1,370 @@
+#include <time.h>
+#include <sys/time.h>
+#include "ntop_includes.h"
+#include"xsmysql/mydbop.h"
+
+
+#define InsertIP4_Log_Sql_FMT_For_Url "insert into tburllog "\
+    "(node,usr,srcip,srcport,dstip,dstport,mac,act,data1,flag,data3,type,proto,date,time,snat_ip,snat_port)"  \
+    "values " \
+    "('%s','%s',%ld,%d,%ld,%d,'%s','%s','%s',%d,'%s','%s','%s',%d,'%s',%ld,%d);"
+
+#define InsertIP4_Log_Sql_FMT_For_Other "insert into tbnetlog "\
+    "(node,usr,srcip,srcport,dstip,dstport,mac,act,data1,flag,data3,type,proto,date,time,snat_ip,snat_port)"  \
+    "values " \
+    "('%s','%s',%ld,%d,%ld,%d,'%s','%s','%s',%d,'%s','%s','%s',%d,'%s',%ld,%d);"
+
+#define InsertIP4_Log_Sql_FMT_For_FileDw "insert into tbfiledwlog "\
+    "(srcip,srcport,dstip,dstport,mac,act,account,filename,type,date,time)"  \
+    "values " \
+    "(%u,%u,%u,%u,'%s','%s','%s',%lu,'%s',%d,'%s');"
+
+/* ************************************************************** */
+
+char *get_L4_protocolType(int proto){
+    char *protocol=NULL;
+    switch (proto){
+    case IPPROTO_UDP:
+        protocol = "UDP";
+        break;
+    case IPPROTO_TCP:
+        protocol = "TCP";
+        break;
+    default:
+        protocol = "Oth";
+        break;
+    }
+    return protocol;
+}
+/* ************************************************************** */
+void XsInsert_FileDw_Log_MyDB(Flow *f,char *bufUrl,char *act,char *type,char *mac,u_int date,char *time){
+    char sql[MAX_SQL_LEN+1];
+
+    snprintf(sql,MAX_SQL_LEN,InsertIP4_Log_Sql_FMT_For_FileDw ,
+             htonl(f->get_cli_host()->get_ip()->get_ipv4()),
+             f->get_cli_port(),
+             htonl(f->get_srv_host()->get_ip()->get_ipv4()),
+             f->get_srv_port(),
+             mac,
+             act,
+             bufUrl,
+             f->virtualnum.hashkey,
+             type,
+             date,
+             time
+             );
+    if(!MyDBOp_ExecSQL_1(&g_xsMySql ,sql))
+        printf("%s:insert table failed\n",sql);
+}
+/* ************************************************************** */
+
+void XsInsert_Other_Log_MyDB(Flow *f,char *bufUrl,char *act,char *type,char *macString,u_int date,char *time){
+    size_t urlLen=strlen(bufUrl);
+    int ret=memcmp(macString,"00:00:00:00:00:00",17);
+    char sql[MAX_SQL_LEN+1];
+    if(urlLen&&ret){
+        snprintf(sql,MAX_SQL_LEN,InsertIP4_Log_Sql_FMT_For_Other ,
+                 " ",                //node
+                 " ", //usr
+                 htonl(f->get_cli_host()->get_ip()->get_ipv4()),
+                 f->get_cli_port(),
+                 htonl(f->get_srv_host()->get_ip()->get_ipv4()),
+                 f->get_srv_port(),
+                 macString,
+                 act,
+                 bufUrl,
+                 0,               //flag
+                 " ",               //data3
+                 type,
+                 get_L4_protocolType(f->get_protocol()),
+                 date,
+                 time,
+                 NULL,
+                 NULL
+                 );
+        if(!MyDBOp_ExecSQL_1(&g_xsMySql ,sql))
+            printf("%s:insert table failed\n",sql);
+    }
+}
+
+void XsInsert_Url_Log_MyDB(Flow *f,char *bufUrl,char *act,char *type,char *macString,u_int date,char *time){
+    size_t urlLen=strlen(bufUrl);
+    int ret=memcmp(macString,"00:00:00:00:00:00",17);
+    char sql[MAX_SQL_LEN+1];
+    if(urlLen&&ret){
+        snprintf(sql,MAX_SQL_LEN,InsertIP4_Log_Sql_FMT_For_Url ,
+                 " ",                //node
+                 " ",//usr
+                 htonl(f->get_cli_host()->get_ip()->get_ipv4()),
+                 f->get_cli_port(),
+                 htonl(f->get_srv_host()->get_ip()->get_ipv4()),
+                 f->get_srv_port(),
+                 macString,
+                 act,
+                 bufUrl,
+                 0,               //flag
+                 " ",               //data3
+                 type,
+                 get_L4_protocolType(f->get_protocol()),
+                 date,
+                 time,
+                 NULL,//snat_ip
+                 NULL//snat_port
+                 );
+        if(!MyDBOp_ExecSQL_1(&g_xsMySql ,sql))
+            printf("%s:insert table failed\n",sql);
+    }
+
+}
+
+/* ************************************************************** */
+
+void XsDeal_Partition_Days(char * tablename,struct rb_root* pMapPartition){
+    int nPartitionCount=0;
+    char szSqlDrop[128]={0};
+    struct rb_node *node;
+    int n;
+
+    nPartitionCount=pMapPartition->ncount;//查 看有多少分区
+    if(g_xsDebug)  printf("Total nPartitionCount %d Table:%s\n",pMapPartition->ncount,tablename);
+
+    if(nPartitionCount>90){
+        node=rb_first(pMapPartition);
+        if(node){
+            n = node->key;
+            if(g_xsDebug)  printf("(%s)erase the first one :%d\n",tablename,n);
+            rb_erase(node, pMapPartition);
+
+            sprintf(szSqlDrop,"alter table %s drop partition p%d;",tablename,n);
+            if(g_xsDebug)  printf("%s Table:%s\n",szSqlDrop,tablename);
+            if(!MyDBOp_ExecSQL_1(&g_xsMySql ,szSqlDrop))
+                printf("%s:insert table failed\n",szSqlDrop);
+        }
+    }
+}
+
+#define InsertIP4_Log_Sql_FMT_For_FileDw "insert into tbfiledwlog "\
+    "(srcip,srcport,dstip,dstport,mac,act,account,filename,type,date,time)"  \
+    "values " \
+    "(%u,%u,%u,%u,'%s','%s','%s',%lu,'%s',%d,'%s');"
+
+/* ************************************************************** */
+void ConnectDB_GetPartition_ForNtop(){
+    MyDBOp_Init(&g_xsMySql);
+    if(false==xsmysql_connect(&g_xsMySql)){
+        MyDBOp_Destroy(&g_xsMySql);
+        exit(0);
+    }
+    MysqlGetPartition_InsertMap(&g_xsMySql,"tburllog",&xslog.mapPartitionUrl);//tburllog
+    MysqlGetPartition_InsertMap(&g_xsMySql,"tbnetlog",&xslog.mapPartition);//tbnetlog
+    MysqlGetPartition_InsertMap(&g_xsMySql,"tbfiledwlog",&mapPartitionFileDw);//tbfiledwlog
+}
+/* ************************************************************** */
+void get_MacString(char *dst,int size,u_char *src){
+    snprintf(dst,size,"%02x:%02x:%02x:%02x:%02x:%02x",
+             src[0],  src[1], src[2], src[3], src[4], src[5]);
+}
+/* ************************************************************** */
+
+void get_timeString(char *time,int size){
+    struct tm st;
+    GetLocalTime(&st);
+    snprintf(time,size,"%02d:%02d:%02d ",st.tm_hour,st.tm_min,st.tm_sec);
+}
+/* ************************************************************** */
+/*查看当前数据表中已有分区并插入红黑树*/
+void   MysqlGetPartition_InsertMap(PMYDBOP pDB,char * tablename,struct rb_root *pMapPartition)
+{
+    //    char sqlPartition[256]="select  partition_name part, partition_expression expr, \
+    //            partition_description descn, table_rows from information_schema.partitions\
+    //            where table_schema=schema() and table_name='tbntoplog';";
+    char sqlPartition[256]={0};
+    snprintf(sqlPartition,sizeof(sqlPartition)-1,"select  partition_name part, partition_expression expr, \
+             partition_description descn, table_rows from information_schema.partitions\
+             where table_schema=schema() and table_name='%s';",tablename);
+
+            MYSQLRECORDSET GetQueryPartition={0};
+    CSqlRecorDset_Init(&GetQueryPartition);
+    CSqlRecorDset_SetConn(&GetQueryPartition,pDB->m_pDB);
+    CSqlRecorDset_CloseRec(&GetQueryPartition);
+    // pDB->m_Query = GetQueryPartition;
+    CSqlRecorDset_ExecSQL(&GetQueryPartition, sqlPartition);
+    if(CSqlRecorDset_GetRecordCount(&GetQueryPartition)==0) {
+        CSqlRecorDset_CloseRec(&GetQueryPartition);
+        CSqlRecorDset_Destroy(&GetQueryPartition);
+        return ;
+    }
+    int i,nPartition;
+    char szPartition[10] = {0};
+    struct rb_node * node_iter ;
+    for(i=0; i< CSqlRecorDset_GetRecordCount(&GetQueryPartition);i++)
+    {
+        CSqlRecorDset_GetFieldValue_String(&GetQueryPartition,"descn",szPartition,10);
+        nPartition = atoi(szPartition);
+        if(g_xsDebug) fprintf(stdout,"Partition:%d,Table:%s\t",nPartition,tablename);
+        node_iter = int_void_rbsearch(pMapPartition,nPartition);
+        if(node_iter&&g_xsDebug)
+            fprintf(stdout,"find partition success in map Table:%s\n",tablename);
+        else{
+            node_iter = int_void_rbinsert(pMapPartition,nPartition,NULL);
+            if(!node_iter&&g_xsDebug)
+                printf("Partition insert map success Table:%s\n",tablename);
+            else{
+                if(g_xsDebug) printf("Partition insert map faild %d Table:%s\n",nPartition,tablename);
+            }
+        }
+        CSqlRecorDset_MoveNext(&GetQueryPartition);
+    }
+    CSqlRecorDset_CloseRec(&GetQueryPartition);
+    CSqlRecorDset_Destroy(&GetQueryPartition);
+    return;
+<<<<<<< HEAD
+}
+/* ************************************************************** */
+
+
+void XsInsert_MyDB(Flow *f,char *bufUrl,char *act,char *type,char *mac,u_int date){
+    char sql[MAX_SQL_LEN+1];
+
+    snprintf(sql,MAX_SQL_LEN,InsertIP4_Log_Sql_FMT_For_FileDw ,
+             htonl(f->get_cli_host()->get_ip()->get_ipv4()),
+             f->get_cli_port(),
+             htonl(f->get_srv_host()->get_ip()->get_ipv4()),
+             f->get_srv_port(),
+             mac,
+             act,
+             bufUrl,
+             f->virtualnum.hashkey,
+             type,
+             20171027,
+             "00:00:00"
+             );
+    if(!MyDBOp_ExecSQL_1(&g_xsMySql ,sql))
+        printf("%s:insert table failed\n",sql);
+=======
+>>>>>>> master
+}
+/* ************************************************************** */
+void   XsMyDBOp_Add_Partition(char *tablename,struct rb_root *pMapPartition,u_int date){
+    struct rb_node *node;
+    node= int_void_rbsearch(pMapPartition,date);
+    if(NULL==node)
+    {
+        char sqlAdd[256];
+        memset(sqlAdd,0,sizeof(sqlAdd));
+        sprintf(sqlAdd,"alter table %s add  partition (partition p%d values in (%u));",tablename,date,date);
+        if(!MyDBOp_ExecSQL_1(&g_xsMySql ,sqlAdd))
+            printf("%s:insert table failed\n",sqlAdd);
+        node = int_void_rbinsert(pMapPartition,date,NULL);
+        if(!node&&g_xsDebug){
+            printf("Partition insert map success:p%d Table:%s\n",date,tablename);
+        }
+        else{
+            if(g_xsDebug) printf("Partition insert map faild:%d Table:%s\n",date,tablename);
+        }
+    }
+}
+
+/* ************************************************************** */
+static inline void MYDBOP_Insert_Ipv4_Log(Flow *f){
+    int res=-1;
+    char sql[MAX_SQL_LEN+1];
+    char macString[20];
+    char bufUrl[1500];
+    char pdate[10];
+    char time[10];
+    char type[15];
+    char act[10];
+
+    memset(sql,0,sizeof(sql));
+    memset(macString,0,sizeof(macString));
+    memset(bufUrl,0,sizeof(bufUrl));
+    memset(pdate,0,sizeof(pdate));
+    memset(time,0,sizeof(time));
+    memset(type,0,sizeof(type));
+    memset(act,0,sizeof(act));
+
+<<<<<<< HEAD
+    get_MacString(macString,sizeof(macString)-1,(u_char *)f->get_cli_host()->get_mac());
+    get_dateString(pdate,sizeof(pdate)-1);
+    u_int date=atoi(pdate);
+    get_timeString(time,sizeof(time)-1);
+    f->getFlowInfoToMysql(bufUrl,sizeof(bufUrl)-1,type,act,macString,date);
+
+    /*若数据库没有该分区，添加该分区，并插入红黑树*/
+    node= int_void_rbsearch(&mapPartition,date);
+    if(NULL==node) {
+        char sqlAdd[256];
+        memset(sqlAdd,0,sizeof(sqlAdd));
+        sprintf(sqlAdd,"alter table tbntoplog add  partition (partition p%d values in (%u));",date,date);
+        MyDBOp_ExecSQL_1(&g_xsMySql,sqlAdd);
+        node = int_void_rbinsert(&mapPartition,date,NULL);
+        if(!node&&g_xsDebug)
+            printf("Partition insert map success:p%d\n",date);
+        else{
+            if(g_xsDebug)  printf("Partition insert map faild:%d\n",date);
+        }
+    }
+=======
+    get_dateString(pdate,sizeof(pdate)-1);
+    u_int date=atoi(pdate);
+    get_timeString(time,sizeof(time)-1);
+    get_MacString(macString,sizeof(macString)-1,(u_char *)f->get_cli_host()->get_mac());
+
+    res= f->getFlowInfoToMysql(bufUrl,sizeof(bufUrl)-1,type,act,macString,date);
+>>>>>>> master
+
+    if(2==res){//file dw log
+        XsMyDBOp_Add_Partition("tbfiledwlog",&mapPartitionFileDw,date);
+
+        XsInsert_FileDw_Log_MyDB(f,bufUrl,act,type,macString,date,time);
+
+        XsDeal_Partition_Days("tbfiledwlog",&mapPartitionFileDw);
+    }else if (1==res){//other log
+
+        XsMyDBOp_Add_Partition("tbnetlog",&xslog.mapPartition,date);
+
+        XsInsert_Other_Log_MyDB(f,bufUrl,act,type,macString,date,time);
+
+        XsDeal_Partition_Days("tbnetlog",&xslog.mapPartition);
+
+    }else if(0==res){//url log
+        /*若数据库没有该分区，添加该分区，并插入红黑树*/
+        XsMyDBOp_Add_Partition("tburllog",&xslog.mapPartitionUrl,date);
+        /*将数据插入数据库(过滤URL为空)*/
+        XsInsert_Url_Log_MyDB(f,bufUrl,act,type,macString,date,time);
+        /*查看map有多少分区,数据库保存90天数据*/
+        XsDeal_Partition_Days("tburllog",&xslog.mapPartitionUrl);
+    }
+}
+
+
+/* ************************************************************** */
+static inline void MYDBOP_Insert_Ipv6_Log(Flow *f){
+
+}
+/* ************************************************************** */
+bool dumpMysqlFlow(Flow *f) {
+    //    f-> cli_host->getInterface();
+    //    if((f->get_cli_host() == NULL) && (f->get_srv_host() == NULL))
+    //        return(false);
+    if(f->get_cli_host()->get_ip()->isIPv4())
+        MYDBOP_Insert_Ipv4_Log(f);
+    else
+        MYDBOP_Insert_Ipv6_Log(f);
+    return(true);
+}
+/* ************************************************************** */
+
+
+bool MyDBOp_InsertDB(Flow * f){
+    if((f->get_cli_host() == NULL) && (f->get_srv_host() == NULL))
+        return(false);
+    if(f->get_cli_host()->get_ip()->isIPv4())
+        MYDBOP_Insert_Ipv4_Log(f);
+    else
+        MYDBOP_Insert_Ipv6_Log(f);
+    return(true);
+}
+
+
